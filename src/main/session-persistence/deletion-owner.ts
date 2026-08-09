@@ -79,12 +79,20 @@ type SessionDeletionUploads = {
   ): Promise<PersistedChatSession>
 }
 
+type ComputeJobDeletionParticipant = {
+  deleteSessionJobs(projectId: string, sessionId: string): Promise<void>
+  deleteProjectJobs(projectId: string): Promise<void>
+  abortSessionJobDeletion?(projectId: string, sessionId: string): Promise<void>
+  abortProjectJobDeletion?(projectId: string): Promise<void>
+}
+
 type SessionPersistenceDeletionOwnerOptions = {
   repository: SessionDeletionRepository
   fileIndex: SessionDeletionFileIndex
   stateOwner: SessionPersistenceStateOwner
   provenance?: SessionDeletionProvenance
   uploads?: SessionDeletionUploads
+  computeJobs?: ComputeJobDeletionParticipant
   assertArchiveMutable(projectId: string, sessionId: string): void
   notifyFilesChanged(event: ProjectFilesChangedEvent): void
   notifySessionsDeleted(sessionIds: string[]): Promise<void>
@@ -112,6 +120,7 @@ class SessionPersistenceDeletionOwner {
   private readonly stateOwner: SessionPersistenceStateOwner
   private readonly provenance: SessionDeletionProvenance | undefined
   private readonly uploads: SessionDeletionUploads | undefined
+  private readonly computeJobs: ComputeJobDeletionParticipant | undefined
   private readonly assertArchiveMutable: (projectId: string, sessionId: string) => void
   private readonly notifyFilesChanged: (event: ProjectFilesChangedEvent) => void
   private readonly notifySessionsDeleted: (sessionIds: string[]) => Promise<void>
@@ -122,6 +131,7 @@ class SessionPersistenceDeletionOwner {
     this.stateOwner = options.stateOwner
     this.provenance = options.provenance
     this.uploads = options.uploads
+    this.computeJobs = options.computeJobs
     this.assertArchiveMutable = options.assertArchiveMutable
     this.notifyFilesChanged = options.notifyFilesChanged
     this.notifySessionsDeleted = options.notifySessionsDeleted
@@ -276,6 +286,7 @@ class SessionPersistenceDeletionOwner {
             options.requireExistingUploadAuthority &&
             error instanceof OrphanLegacyUploadAuthorityMissingError
           ) {
+            await this.computeJobs?.deleteProjectJobs(projectId)
             this.fileIndex.markReconciliationIncomplete()
             await this.fileIndex.softDeleteProject(projectId)
             await this.notifySessionsDeleted(deletedSessionIds)
@@ -289,6 +300,7 @@ class SessionPersistenceDeletionOwner {
     if (deletionState === 'legacy-committed') {
       await this.repository.markCommittedProjectSessionsPrepared(projectId)
     }
+    await this.computeJobs?.deleteProjectJobs(projectId)
     await this.repository.deleteProjectSessions(projectId)
     this.stateOwner.removeProject(projectId, deletedSessionIds)
     await this.fileIndex.softDeleteProject(projectId)
@@ -322,6 +334,7 @@ class SessionPersistenceDeletionOwner {
     let token: ManagedFileSoftDeleteToken | undefined
     let receipt: SessionDeletionReceipt = { kind: 'ordinary', projectId, sessionId }
     let jsonDeleted = false
+    let computeJobsDeleted = false
 
     try {
       const loadedSession = await this.repository.loadSessionWithDiagnostics(projectId, sessionId)
@@ -333,6 +346,10 @@ class SessionPersistenceDeletionOwner {
         session = await this.prepareSessionUploadsForTerminalDelete(session)
       if (session && this.provenance) {
         receipt = await this.provenance.prepareSessionDeletion(session)
+      }
+      if (this.computeJobs) {
+        await this.computeJobs.deleteSessionJobs(projectId, sessionId)
+        computeJobsDeleted = true
       }
       if (receipt.kind === 'ordinary') {
         token = await this.fileIndex.softDeleteSession(projectId, sessionId)
@@ -346,6 +363,9 @@ class SessionPersistenceDeletionOwner {
         if (!jsonDeleted) {
           if (receipt.kind === 'retained') await this.provenance?.abortSessionDeletion(receipt)
           if (token) await this.fileIndex.restoreSession(projectId, sessionId, token)
+          if (computeJobsDeleted) {
+            await this.computeJobs?.abortSessionJobDeletion?.(projectId, sessionId)
+          }
         } else {
           this.fileIndex.markReconciliationIncomplete()
         }
@@ -397,4 +417,8 @@ class SessionPersistenceDeletionOwner {
 }
 
 export { SessionPersistenceDeletionOwner, hasLegacySessionUpload }
-export type { ProjectSessionDeletionResult, SessionPersistenceDeletionOwnerOptions }
+export type {
+  ComputeJobDeletionParticipant,
+  ProjectSessionDeletionResult,
+  SessionPersistenceDeletionOwnerOptions
+}

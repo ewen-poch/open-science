@@ -435,13 +435,15 @@ describe('Session persistence coordinator architecture', () => {
       'uploads:optional',
       'artifactStorage:optional',
       'permissionGrants:optional',
-      'log:defaulted'
+      'log:defaulted',
+      'computeJobs:optional'
     ])
     expect(exportedNames(facadeFile, 'value')).toEqual(
       ['SessionPersistenceCoordinator', 'SessionRuntimeContextRevisionConflictError'].sort()
     )
     expect(exportedNames(facadeFile, 'type')).toEqual(
       [
+        'ComputeJobDeletionParticipant',
         'PatchSessionRuntimeContextCommand',
         'ProjectSessionDeletionResult',
         'SessionDeletionHandlers',
@@ -457,6 +459,7 @@ describe('Session persistence coordinator architecture', () => {
   it('composes each owner once and keeps mutable state with its sole owner', () => {
     expect(fields(facade)).toEqual(
       [
+        'computeJobs',
         'deletedProjects',
         'deletedSessions',
         'deletionOwner',
@@ -493,6 +496,7 @@ describe('Session persistence coordinator architecture', () => {
     expect(fields(deletionOwner)).toEqual(
       [
         'assertArchiveMutable',
+        'computeJobs',
         'fileIndex',
         'notifyFilesChanged',
         'notifySessionsDeleted',

@@ -3263,12 +3263,20 @@ describe('SessionPersistenceCoordinator', () => {
         .fn()
         .mockRejectedValue(new OrphanLegacyUploadAuthorityMissingError('missing Upload authority'))
     }
+    const computeJobs = {
+      deleteSessionJobs: vi.fn(),
+      deleteProjectJobs: vi.fn(async () => undefined)
+    }
     const coordinator = new SessionPersistenceCoordinator(
       repository,
       fileIndex,
       undefined,
       undefined,
-      uploads
+      uploads,
+      undefined,
+      undefined,
+      createTestLogger(),
+      computeJobs
     )
 
     await expect(
@@ -3282,6 +3290,7 @@ describe('SessionPersistenceCoordinator', () => {
 
     expect(fileIndex.markReconciliationIncomplete).toHaveBeenCalledOnce()
     expect(fileIndex.softDeleteProject).toHaveBeenCalledWith('project-1')
+    expect(computeJobs.deleteProjectJobs).toHaveBeenCalledWith('project-1')
     expect(repository.markCommittedProjectSessionsPrepared).not.toHaveBeenCalled()
     expect(repository.deleteProjectSessions).not.toHaveBeenCalled()
   })
@@ -3749,6 +3758,122 @@ describe('SessionPersistenceCoordinator', () => {
       sources: ['artifact', 'upload'],
       kind: 'reset'
     })
+  })
+
+  it('cleans Compute Job lifecycle before deleting a Session owner', async () => {
+    const resources = new Set(['job-row', 'remote-workdir', 'pending-notification'])
+    const computeJobs = {
+      deleteSessionJobs: vi.fn(async (projectId: string, sessionId: string) => {
+        expect({ projectId, sessionId }).toEqual({
+          projectId: 'project-1',
+          sessionId: 'session-1'
+        })
+        resources.clear()
+      }),
+      deleteProjectJobs: vi.fn()
+    }
+    const repository = createSessionRepository({
+      deleteSession: vi.fn(async () => {
+        expect(resources.size).toBe(0)
+      })
+    })
+    const coordinator = new SessionPersistenceCoordinator(
+      repository,
+      createFileIndex(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      createTestLogger(),
+      computeJobs
+    )
+
+    await coordinator.deleteSession('project-1', 'session-1')
+
+    expect(computeJobs.deleteSessionJobs).toHaveBeenCalledOnce()
+    expect(resources).toEqual(new Set())
+  })
+
+  it('cleans Compute Job lifecycle before deleting a Project owner', async () => {
+    const resources = new Set(['job-row', 'remote-workdir', 'pending-notification'])
+    const computeJobs = {
+      deleteSessionJobs: vi.fn(),
+      deleteProjectJobs: vi.fn(async (projectId: string) => {
+        expect(projectId).toBe('project-1')
+        resources.clear()
+      })
+    }
+    const repository = createSessionRepository({
+      deleteProjectSessions: vi.fn(async () => {
+        expect(resources.size).toBe(0)
+      })
+    })
+    const coordinator = new SessionPersistenceCoordinator(
+      repository,
+      createFileIndex(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      createTestLogger(),
+      computeJobs
+    )
+
+    await coordinator.deleteProjectSessions('project-1')
+
+    expect(computeJobs.deleteProjectJobs).toHaveBeenCalledOnce()
+    expect(resources).toEqual(new Set())
+  })
+
+  it('restores Compute Job admission when Session authority deletion fails', async () => {
+    const computeJobs = {
+      deleteSessionJobs: vi.fn(async () => undefined),
+      deleteProjectJobs: vi.fn(),
+      abortSessionJobDeletion: vi.fn(async () => undefined)
+    }
+    const coordinator = new SessionPersistenceCoordinator(
+      createSessionRepository({
+        deleteSession: vi.fn().mockRejectedValue(new Error('disk locked'))
+      }),
+      createFileIndex(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      createTestLogger(),
+      computeJobs
+    )
+
+    await expect(coordinator.deleteSession('project-1', 'session-1')).rejects.toThrow('disk locked')
+    expect(computeJobs.abortSessionJobDeletion).toHaveBeenCalledWith('project-1', 'session-1')
+  })
+
+  it('restores Compute Job admission when Project authority deletion stays live', async () => {
+    const computeJobs = {
+      deleteSessionJobs: vi.fn(),
+      deleteProjectJobs: vi.fn(async () => undefined),
+      abortProjectJobDeletion: vi.fn(async () => undefined)
+    }
+    const coordinator = new SessionPersistenceCoordinator(
+      createSessionRepository({
+        deleteProjectSessions: vi.fn().mockRejectedValue(new Error('directory busy')),
+        getProjectSessionDeletionState: vi.fn().mockResolvedValue('live')
+      }),
+      createFileIndex(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      createTestLogger(),
+      computeJobs
+    )
+
+    await expect(coordinator.deleteProjectSessions('project-1')).rejects.toThrow('directory busy')
+    expect(computeJobs.abortProjectJobDeletion).toHaveBeenCalledWith('project-1')
   })
 })
 

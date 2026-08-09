@@ -15,6 +15,7 @@
 // design.md §8 boundary 3 asks for.
 export class DispatchTracker {
   private readonly inFlight = new Set<string>()
+  private readonly waiters = new Map<string, Set<() => void>>()
 
   // Marks a job's dispatch as started. Call synchronously before the first await of dispatchJob so
   // the poller can never observe the job as untracked while its dispatch is genuinely running.
@@ -25,11 +26,27 @@ export class DispatchTracker {
   // Marks a job's dispatch as finished (success or failure). Always call from a finally block.
   end(jobId: string): void {
     this.inFlight.delete(jobId)
+    const waiters = this.waiters.get(jobId)
+    this.waiters.delete(jobId)
+    for (const resolve of waiters ?? []) resolve()
   }
 
   // Whether a job's dispatch is currently in flight in this process.
   has(jobId: string): boolean {
     return this.inFlight.has(jobId)
+  }
+
+  async waitFor(jobIds: readonly string[]): Promise<void> {
+    await Promise.all(
+      [...new Set(jobIds)].map((jobId) => {
+        if (!this.inFlight.has(jobId)) return Promise.resolve()
+        return new Promise<void>((resolve) => {
+          const waiters = this.waiters.get(jobId) ?? new Set()
+          waiters.add(resolve)
+          this.waiters.set(jobId, waiters)
+        })
+      })
+    )
   }
 }
 

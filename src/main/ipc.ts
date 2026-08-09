@@ -154,7 +154,10 @@ import { isPermissionGrantScopeLive } from './permission-grants/scope-liveness'
 import { registerPermissionGrantIpcAdapter } from './permission-grants/ipc'
 import { createPermissionGrantProjectionController } from './permission-grants/projection-controller'
 import { reconcilePermissionGrantOwners } from './permission-grants/reconciliation'
-import { SessionPersistenceCoordinator } from './session-persistence/coordinator'
+import {
+  SessionPersistenceCoordinator,
+  type ComputeJobDeletionParticipant
+} from './session-persistence/coordinator'
 import { type SessionPersistenceBackend } from './session-persistence/ipc'
 import { tryDecryptKey } from './settings/crypto'
 import { SETTINGS_INSTALL_LOG_CHANNEL, registerSettingsIpcHandlers } from './settings/ipc'
@@ -507,6 +510,33 @@ const createApplicationModules = async (
     configRoot,
     resolveDataRoot()
   )
+  const computeJobDeletionRef: { current?: Required<ComputeJobDeletionParticipant> } = {}
+  const computeJobDeletionPort = {
+    deleteSessionJobs: (projectId: string, sessionId: string): Promise<void> => {
+      if (!computeJobDeletionRef.current) {
+        throw new Error('Compute Job deletion is not initialized.')
+      }
+      return computeJobDeletionRef.current.deleteSessionJobs(projectId, sessionId)
+    },
+    deleteProjectJobs: (projectId: string): Promise<void> => {
+      if (!computeJobDeletionRef.current) {
+        throw new Error('Compute Job deletion is not initialized.')
+      }
+      return computeJobDeletionRef.current.deleteProjectJobs(projectId)
+    },
+    abortSessionJobDeletion: (projectId: string, sessionId: string): Promise<void> => {
+      if (!computeJobDeletionRef.current) {
+        throw new Error('Compute Job deletion is not initialized.')
+      }
+      return computeJobDeletionRef.current.abortSessionJobDeletion(projectId, sessionId)
+    },
+    abortProjectJobDeletion: (projectId: string): Promise<void> => {
+      if (!computeJobDeletionRef.current) {
+        throw new Error('Compute Job deletion is not initialized.')
+      }
+      return computeJobDeletionRef.current.abortProjectJobDeletion(projectId)
+    }
+  }
   const sessionPersistenceCoordinator = new SessionPersistenceCoordinator(
     sessionRepository,
     projectFilesRepository,
@@ -517,7 +547,9 @@ const createApplicationModules = async (
     {
       reconcileSessions: (sessions) =>
         reconcilePermissionGrantOwners(permissionGrantRegistry, { sessions })
-    }
+    },
+    undefined,
+    computeJobDeletionPort
   )
   const uploadCommandOwner = createUploadCommandOwner(uploadRepository, {
     withSessionMutation: (projectId, sessionId, mutation) =>
@@ -968,10 +1000,12 @@ const createApplicationModules = async (
   surfaceAdapters = beforeAcpAdapters
   const {
     computeService,
+    jobDeletionOwner,
     jobRepository,
     hostRepository,
     enabledComputeHostsRegistry: hostsRegistry
   } = computeIpcModule
+  computeJobDeletionRef.current = jobDeletionOwner
   const dataRoot = resolveDataRoot()
   // Start the JobPoller wired to the shared broadcaster so every state/tail change is pushed to all
   // renderer windows via 'compute:job-updated' (Phase 3d, design.md §9 + §15.3). The dispatcher
@@ -979,7 +1013,13 @@ const createApplicationModules = async (
   // Phase 3b: harvestFn drives automatic harvest on terminal transitions; broadcast + storageRoot
   // wire the compute_done notification emitter for all three terminal outcomes (issue 06).
   await modules.add(
-    { computeService, hostRepository, jobRepository, storageRoot: dataRoot },
+    {
+      computeService,
+      jobDeletionOwner,
+      hostRepository,
+      jobRepository,
+      storageRoot: dataRoot
+    },
     (dependencies) => {
       const jobPoller = createComputeJobRuntime(dependencies)
       return {

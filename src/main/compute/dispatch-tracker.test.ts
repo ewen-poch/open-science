@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { DispatchTracker } from './dispatch-tracker'
 
@@ -25,5 +25,23 @@ describe('DispatchTracker', () => {
     const tracker = new DispatchTracker()
     expect(() => tracker.end('never-began')).not.toThrow()
     expect(tracker.has('never-began')).toBe(false)
+  })
+
+  it('waits until every selected in-flight dispatch has ended', async () => {
+    const tracker = new DispatchTracker()
+    tracker.begin('job-1')
+    tracker.begin('job-2')
+    const settled = vi.fn()
+    const waiting = tracker.waitFor(['job-1', 'job-2']).then(settled)
+
+    await Promise.resolve()
+    expect(settled).not.toHaveBeenCalled()
+    tracker.end('job-1')
+    await Promise.resolve()
+    expect(settled).not.toHaveBeenCalled()
+    tracker.end('job-2')
+
+    await waiting
+    expect(settled).toHaveBeenCalledOnce()
   })
 })

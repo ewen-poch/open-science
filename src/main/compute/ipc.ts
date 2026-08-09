@@ -44,6 +44,7 @@ import { ComputeService, type ArtifactResolver } from './compute-service'
 import { ConcurrencyManager } from './concurrency-manager'
 import { ComputeHostRepository } from './repository'
 import { ComputeJobRepository } from './job-repository'
+import { ComputeJobDeletionOwner } from './job-deletion-owner'
 import { readSshConfigHostAliases } from './ssh-config'
 import { SystemSshRunner } from './ssh-runner'
 import { SystemScpRunner } from './scp-runner'
@@ -442,28 +443,30 @@ export const broadcastJobUpdated = (summary: JobSummary): void => {
   broadcastToRenderers(COMPUTE_JOB_UPDATED_CHANNEL, summary)
 }
 
-// Builds the onJobUpdated hook shared by the JobPoller (poll transitions/tails) and the
-// ComputeService/dispatcher (submitted→running→error transitions). Looks up the host display name
-// asynchronously, then broadcasts. Fire-and-forget: a transient failure to fetch the host falls
-// back to the provider_id string so the broadcast always happens.
 export const createJobUpdatedBroadcaster =
-  (hostRepository: ComputeHostRepository, storageRoot: string): ((job: ComputeJob) => void) =>
+  (
+    hostRepository: ComputeHostRepository,
+    storageRoot: string,
+    jobRepository: Pick<ComputeJobRepository, 'get'>
+  ): ((job: ComputeJob) => void) =>
   (job) => {
-    void hostRepository
-      .get(job.provider_id)
-      .then(async (host) => {
-        const summary = await toJobSummary(job, host?.displayName ?? job.provider_id, storageRoot)
-        broadcastJobUpdated(summary)
-      })
-      .catch(async () => {
-        const summary = await toJobSummary(job, job.provider_id, storageRoot)
-        broadcastJobUpdated(summary)
-      })
+    void (async () => {
+      let displayName = job.provider_id
+      try {
+        const host = await hostRepository.get(job.provider_id)
+        if (host) displayName = host.displayName
+      } catch {
+        // Preserve the provider id fallback when host projection is unavailable.
+      }
+      if (!(await jobRepository.get(job.job_id))) return
+      broadcastJobUpdated(await toJobSummary(job, displayName, storageRoot))
+    })().catch(() => undefined)
   }
 
 type ComputeIpcModule = {
   handlers: ComputeHandlers
   computeService: ComputeService
+  jobDeletionOwner: ComputeJobDeletionOwner
   jobRepository: ComputeJobRepository
   hostRepository: ComputeHostRepository
   enabledComputeHostsRegistry: EnabledComputeHostsRegistry
@@ -494,7 +497,12 @@ const createComputeIpcModule = (
     legacyComputeGrants ?? createSettingsComputeGrantPort(storageRoot)
 
   // Broadcast dispatcher status transitions to the renderer, same hook shape as the JobPoller uses.
-  const onJobUpdated = createJobUpdatedBroadcaster(repository, dataRoot)
+  const onJobUpdated = createJobUpdatedBroadcaster(repository, dataRoot, jobRepository)
+  const jobDeletionOwner = new ComputeJobDeletionOwner({
+    jobRepository,
+    hostRepository: repository,
+    runner: new SystemSshRunner()
+  })
 
   const handlers = createComputeHandlers(
     repository,
@@ -514,6 +522,7 @@ const createComputeIpcModule = (
   return {
     handlers,
     computeService: handlers.computeService,
+    jobDeletionOwner,
     jobRepository,
     hostRepository: repository,
     enabledComputeHostsRegistry
