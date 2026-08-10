@@ -150,6 +150,20 @@ const sessionBindingTopologyHash = (session: PersistedChatSession): string => {
   return createHash('sha256').update(JSON.stringify(topology)).digest('hex')
 }
 
+const mergeMainOwnedRelayMessages = (
+  submitted: readonly PersistedChatMessage[],
+  authoritative: readonly PersistedChatMessage[] | undefined
+): PersistedChatMessage[] => {
+  const authoritativeRelays =
+    authoritative?.filter(
+      (message) =>
+        message.relayedFrom?.kind === 'side-chat' && message.relayedFrom.direction === 'to-main'
+    ) ?? []
+  if (authoritativeRelays.length === 0) return [...submitted]
+  const relayIds = new Set(authoritativeRelays.map((message) => message.id))
+  return [...submitted.filter((message) => !relayIds.has(message.id)), ...authoritativeRelays]
+}
+
 type FinalizedArtifactBindingValidation =
   | { status: 'valid' }
   | { status: 'unavailable' }
@@ -290,7 +304,7 @@ class SessionPersistenceStateOwner {
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
       throw new Error('Session runtime context expected revision must be a non-negative integer.')
     }
-    if (Object.keys(patch).some((owner) => owner !== 'plan')) {
+    if (Object.keys(patch).some((owner) => owner !== 'plan' && owner !== 'permission')) {
       throw new Error('Session runtime context patch contains an unknown authority owner.')
     }
 
@@ -367,13 +381,21 @@ class SessionPersistenceStateOwner {
     delete rendererOwnedSession.runtimeContext
     delete rendererOwnedSession.archivedAt
     const authority = authoritative.status === 'found' ? authoritative.session : undefined
-    const mainOwnedStatus =
-      authority?.status === 'waiting-plan-approval' ||
-      rendererOwnedSession.status === 'waiting-plan-approval'
+    const permissionOwnedStatus =
+      authority?.runtimeContext?.permission?.state === 'pending'
+        ? 'waiting-permission'
+        : rendererOwnedSession.status === 'waiting-permission'
+          ? (authority?.status ?? 'idle')
+          : undefined
+    const mainOwnedStatus = permissionOwnedStatus
+      ? permissionOwnedStatus
+      : authority?.status === 'waiting-plan-approval' ||
+          rendererOwnedSession.status === 'waiting-plan-approval'
         ? (authority?.status ?? 'idle')
         : undefined
     const mergedSession: PersistedChatSession = {
       ...rendererOwnedSession,
+      messages: mergeMainOwnedRelayMessages(rendererOwnedSession.messages, authority?.messages),
       ...(authority?.runtimeContext ? { runtimeContext: authority.runtimeContext } : {}),
       ...(authority?.archivedAt ? { archivedAt: authority.archivedAt } : {}),
       ...(mainOwnedStatus ? { status: mainOwnedStatus } : {}),

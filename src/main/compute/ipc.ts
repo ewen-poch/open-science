@@ -39,7 +39,7 @@ import { opencodeConfigDir } from '../agent-framework/opencode'
 import { broadcastToRenderers } from '../renderer-broadcast'
 import type { TaskNotificationService } from '../notifications/task-notifications'
 import { buildComputeApprovalBroadcast } from '../notifications/electron-wiring'
-import { ComputeApprovalBroker } from './compute-approval-broker'
+import { ComputeApprovalBroker, type ComputeApprovalContext } from './compute-approval-broker'
 import { ComputeService, type ArtifactResolver } from './compute-service'
 import { ConcurrencyManager } from './concurrency-manager'
 import { ComputeHostRepository } from './repository'
@@ -188,6 +188,8 @@ type ComputeHandlers = {
   // 'conversation' and 'project' scopes in addition to 'once' and 'deny' (issue 05).
   approvalRespond: (id: string, decision: ComputeApprovalDecision) => void
   approvalReplay: (id: string) => ComputeApprovalRequest | null
+  approvalPauseSession: (sessionId: string) => void
+  approvalResumeSession: (sessionId: string) => void
   // Returns JobSummary[] for a session, optionally filtered by status (renderer feed, issue 05).
   jobsList: (filter: { sessionId: string; status?: string[] }) => Promise<JobSummary[]>
   // Returns jobs with notifiedAt set and notificationConsumedAt null (issue 05 restart recovery).
@@ -236,10 +238,13 @@ const createComputeHandlers = (
             onNotificationError: (error) =>
               log.warn('compute approval notification failed', errorLogFields(error))
           })
-        : (request: ComputeApprovalRequest) => {
+        : (request: ComputeApprovalRequest, context?: ComputeApprovalContext) => {
             // Tests and isolated registrations without the notification service still receive cards.
             for (const win of BrowserWindow.getAllWindows()) {
-              win.webContents.send('compute:approval-request', request)
+              win.webContents.send('compute:approval-request', {
+                ...request,
+                ...(context?.sessionId ? { session_id: context.sessionId } : {})
+              })
             }
           },
       onSettled: taskNotifications
@@ -377,6 +382,8 @@ const createComputeHandlers = (
     computeService: service,
     approvalRespond: (id, decision) => broker.respond(id, decision),
     approvalReplay: (id) => broker.getPending(id),
+    approvalPauseSession: (sessionId) => broker.pauseSession(sessionId),
+    approvalResumeSession: (sessionId) => broker.resumeSession(sessionId),
     jobsList: async (filter) => {
       if (!jobRepository || !storageRoot) return []
       const hosts = await repository.list()
@@ -437,32 +444,28 @@ const syncCurrentComputeSkillDocuments = async (
   )
 }
 
-// Broadcasts a job summary to all renderer windows. Called by the JobPoller onJobUpdated hook
-// and by the job dispatcher on status transitions (Phase 3d, design.md §9).
 export const broadcastJobUpdated = (summary: JobSummary): void => {
   broadcastToRenderers(COMPUTE_JOB_UPDATED_CHANNEL, summary)
 }
+type ComputeJobLookup = Pick<ComputeJobRepository, 'get'>
 
 export const createJobUpdatedBroadcaster =
   (
-    hostRepository: ComputeHostRepository,
+    hosts: ComputeHostRepository,
     storageRoot: string,
-    jobRepository: Pick<ComputeJobRepository, 'get'>
+    jobs: ComputeJobLookup
   ): ((job: ComputeJob) => void) =>
   (job) => {
-    void (async () => {
-      let displayName = job.provider_id
-      try {
-        const host = await hostRepository.get(job.provider_id)
-        if (host) displayName = host.displayName
-      } catch {
-        // Preserve the provider id fallback when host projection is unavailable.
-      }
-      if (!(await jobRepository.get(job.job_id))) return
-      broadcastJobUpdated(await toJobSummary(job, displayName, storageRoot))
-    })().catch(() => undefined)
+    void hosts
+      .get(job.provider_id)
+      .catch(() => undefined)
+      .then(async (host) => {
+        if (!(await jobs.get(job.job_id))) return
+        const displayName = host?.displayName ?? job.provider_id
+        broadcastJobUpdated(await toJobSummary(job, displayName, storageRoot))
+      })
+      .catch(() => undefined)
   }
-
 type ComputeIpcModule = {
   handlers: ComputeHandlers
   computeService: ComputeService
@@ -472,8 +475,6 @@ type ComputeIpcModule = {
   enabledComputeHostsRegistry: EnabledComputeHostsRegistry
 }
 
-// Constructs the shared Compute module without installing an Electron transport. Keeping this seam
-// explicit lets application composition start the Job runtime before any renderer adapter exists.
 const createComputeIpcModule = (
   repository = createDefaultComputeHostRepository(),
   jobRepository = createDefaultComputeJobRepository(),
@@ -496,7 +497,6 @@ const createComputeIpcModule = (
   const effectiveLegacyComputeGrants =
     legacyComputeGrants ?? createSettingsComputeGrantPort(storageRoot)
 
-  // Broadcast dispatcher status transitions to the renderer, same hook shape as the JobPoller uses.
   const onJobUpdated = createJobUpdatedBroadcaster(repository, dataRoot, jobRepository)
   const jobDeletionOwner = new ComputeJobDeletionOwner({
     jobRepository,

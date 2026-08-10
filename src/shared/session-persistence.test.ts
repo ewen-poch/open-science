@@ -3,12 +3,15 @@ import { describe, expect, it } from 'vitest'
 import { MAX_ACP_SESSION_IMAGE_BYTES } from './acp'
 
 import {
+  SESSION_FILE_VERSION,
   createSessionFile,
   sanitizeActivityGroup,
   normalizeSessionFile,
   sanitizeMessageImages,
   sanitizeToolActivity,
   type PersistedChatSession,
+  type PersistedSideChat,
+  type SessionPermissionRuntimeContext,
   type SessionPlanRuntimeContext
 } from './session-persistence'
 import {
@@ -216,6 +219,50 @@ describe('interrupted turn intent persistence', () => {
       expect.objectContaining({ id: 'user-plan', turnIntent: 'plan-first' }),
       expect.not.objectContaining({ turnIntent: expect.anything() }),
       expect.not.objectContaining({ turnIntent: expect.anything() })
+    ])
+  })
+})
+
+describe('side chat relay persistence', () => {
+  it('preserves only the closed side-chat advisory marker on user messages', () => {
+    const restored = normalizeSessionFile({
+      ...createSessionWithActivity(undefined),
+      activities: undefined,
+      messages: [
+        {
+          id: 'side-chat-advisory',
+          role: 'user',
+          content: 'Please use a black line.',
+          relayedFrom: { kind: 'side-chat', direction: 'to-main' },
+          createdAt: 1,
+          updatedAt: 1
+        },
+        {
+          id: 'unknown-relay',
+          role: 'user',
+          content: 'Do not restore arbitrary routing metadata.',
+          relayedFrom: { kind: 'external-agent', direction: 'to-main' },
+          createdAt: 2,
+          updatedAt: 2
+        },
+        {
+          id: 'agent-relay',
+          role: 'agent',
+          content: 'No relay marker on agent messages.',
+          relayedFrom: { kind: 'side-chat', direction: 'to-main' },
+          createdAt: 3,
+          updatedAt: 3
+        }
+      ]
+    })
+
+    expect(restored?.messages).toEqual([
+      expect.objectContaining({
+        id: 'side-chat-advisory',
+        relayedFrom: { kind: 'side-chat', direction: 'to-main' }
+      }),
+      expect.not.objectContaining({ relayedFrom: expect.anything() }),
+      expect.not.objectContaining({ relayedFrom: expect.anything() })
     ])
   })
 })
@@ -922,6 +969,258 @@ describe('normalizeSessionFile with activities', () => {
       }
     })
     expect(restored?.error).toBeUndefined()
+  })
+
+  it('normalizes legacy permission authority to pending and accepts only known lifecycle states', () => {
+    const permission = {
+      request: {
+        requestId: 'permission-1',
+        sessionId: 'session-1',
+        toolCallId: 'tool-1',
+        title: 'Run npm test',
+        options: [{ optionId: 'deny', name: 'Deny', kind: 'reject_once' }]
+      },
+      originatingPromptMessageId: 'prompt-1',
+      fingerprint: 'a'.repeat(64),
+      createdAt: 1
+    }
+    const normalizePermission = (
+      candidate: Record<string, unknown>
+    ): SessionPermissionRuntimeContext | undefined =>
+      normalizeSessionFile(
+        {
+          ...createSessionWithActivity(undefined),
+          activities: undefined,
+          runtimeContext: { version: 1, revision: 1, permission: candidate }
+        },
+        { preserveRuntimeState: true }
+      )?.runtimeContext?.permission
+
+    expect(normalizePermission(permission)?.state).toBe('pending')
+    expect(normalizePermission({ ...permission, state: 'continuing' })?.state).toBe('continuing')
+    expect(normalizePermission({ ...permission, state: 'unknown' })).toBeUndefined()
+  })
+
+  it('rearms a prompt-bound continuing permission after restart', () => {
+    const restored = normalizeSessionFile(
+      createSessionFile({
+        ...(createSessionWithActivity(undefined) as PersistedChatSession),
+        activities: undefined,
+        status: 'running',
+        activeRun: { promptMessageId: 'prompt-1', startedAt: 2 },
+        messages: [
+          {
+            id: 'prompt-1',
+            role: 'user',
+            content: 'Run the tests',
+            status: 'complete',
+            eventIds: [],
+            createdAt: 1,
+            updatedAt: 1
+          }
+        ],
+        runtimeContext: {
+          version: 1,
+          revision: 4,
+          permission: {
+            state: 'continuing',
+            request: {
+              requestId: 'permission-1',
+              sessionId: 'session-1',
+              toolCallId: 'tool-1',
+              title: 'Run npm test',
+              options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }]
+            },
+            originatingPromptMessageId: 'prompt-1',
+            fingerprint: 'a'.repeat(64),
+            createdAt: 2
+          }
+        }
+      })
+    )
+
+    expect(restored).toMatchObject({
+      status: 'waiting-permission',
+      runtimeContext: {
+        version: 1,
+        revision: 4,
+        permission: {
+          state: 'pending',
+          originatingPromptMessageId: 'prompt-1'
+        }
+      }
+    })
+    expect(restored?.activeRun).toBeUndefined()
+    expect(restored?.resumeRecovery).toBeUndefined()
+    expect(restored?.error).toBeUndefined()
+    expect(restored?.messages[0]?.interrupted).toBeUndefined()
+  })
+
+  it('releases an invalid continuing permission before generic restart recovery', () => {
+    const restored = normalizeSessionFile(
+      createSessionFile({
+        ...(createSessionWithActivity(undefined) as PersistedChatSession),
+        activities: undefined,
+        status: 'running',
+        activeRun: { promptMessageId: 'prompt-1', startedAt: 2 },
+        messages: [
+          {
+            id: 'prompt-1',
+            role: 'user',
+            content: 'Run the tests',
+            status: 'complete',
+            eventIds: [],
+            createdAt: 1,
+            updatedAt: 1
+          }
+        ],
+        runtimeContext: {
+          version: 1,
+          revision: 4,
+          permission: {
+            state: 'continuing',
+            request: {
+              requestId: 'permission-1',
+              sessionId: 'session-1',
+              toolCallId: 'tool-1',
+              title: 'Run npm test',
+              options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }]
+            },
+            originatingPromptMessageId: 'missing-prompt',
+            fingerprint: 'a'.repeat(64),
+            createdAt: 2
+          }
+        }
+      })
+    )
+
+    expect(restored?.status).toBe('error')
+    expect(restored?.runtimeContext?.permission).toBeUndefined()
+    expect(restored?.resumeRecovery).toEqual({
+      kind: 'resume-required',
+      cause: 'app-restart',
+      promptMessageId: 'prompt-1'
+    })
+  })
+
+  it('hoists legacy Side chat relays without changing the Session envelope version', () => {
+    const persisted = createSessionFile({
+      ...(createSessionWithActivity(undefined) as PersistedChatSession),
+      activities: undefined,
+      runtimeContext: {
+        version: 1,
+        revision: 7,
+        sideChat: {
+          version: 1,
+          id: 'side-chat-123',
+          lifecycle: 'interrupted',
+          frameworkId: 'codex',
+          backendId: 'codex-responses',
+          providerSessionId: 'provider-session-1',
+          providerContinuityToken: 'bridge-token-1',
+          model: 'gpt-5.6-sol',
+          historyPreamble: 'Main context',
+          entries: [
+            { id: 'user-1', kind: 'message', role: 'user', text: 'Question' },
+            { id: 'assistant-1', kind: 'message', role: 'assistant', text: 'Answer' },
+            { id: 'tool-1', kind: 'tool', title: 'send_message', status: 'completed' }
+          ],
+          pendingRelays: [{ id: 'side-chat-message-1', text: 'Tell Main', createdAt: 10 }],
+          createdAt: 1,
+          updatedAt: 10
+        } as unknown as PersistedSideChat
+      }
+    })
+
+    expect(persisted.version).toBe(SESSION_FILE_VERSION)
+    expect(normalizeSessionFile(persisted)?.runtimeContext).toEqual({
+      version: 1,
+      revision: 7,
+      sideChat: {
+        version: 1,
+        id: 'side-chat-123',
+        lifecycle: 'interrupted',
+        frameworkId: 'codex',
+        backendId: 'codex-responses',
+        providerSessionId: 'provider-session-1',
+        providerContinuityToken: 'bridge-token-1',
+        model: 'gpt-5.6-sol',
+        historyPreamble: 'Main context',
+        entries: [
+          { id: 'user-1', kind: 'message', role: 'user', text: 'Question' },
+          { id: 'assistant-1', kind: 'message', role: 'assistant', text: 'Answer' },
+          { id: 'tool-1', kind: 'tool', title: 'send_message', status: 'completed' }
+        ],
+        createdAt: 1,
+        updatedAt: 10
+      },
+      sideChatRelays: [
+        {
+          id: 'side-chat-message-1',
+          sideChatId: 'side-chat-123',
+          text: 'Tell Main',
+          createdAt: 10
+        }
+      ]
+    })
+  })
+
+  it('round-trips parent-owned Side chat relays without an open Side chat', () => {
+    const persisted = createSessionFile({
+      ...(createSessionWithActivity(undefined) as PersistedChatSession),
+      activities: undefined,
+      runtimeContext: {
+        version: 1,
+        revision: 8,
+        sideChatRelays: [
+          {
+            id: 'side-chat-message-closed',
+            sideChatId: 'side-chat-closed',
+            text: 'Still deliver this',
+            createdAt: 11
+          }
+        ]
+      }
+    })
+
+    expect(normalizeSessionFile(persisted)?.runtimeContext).toEqual({
+      version: 1,
+      revision: 8,
+      sideChatRelays: [
+        {
+          id: 'side-chat-message-closed',
+          sideChatId: 'side-chat-closed',
+          text: 'Still deliver this',
+          createdAt: 11
+        }
+      ]
+    })
+  })
+
+  it('drops a malformed Side chat while retaining valid Plan authority', () => {
+    const plan = createRuntimePlan()
+    const restored = normalizeSessionFile({
+      ...(createSessionWithActivity(undefined) as PersistedChatSession),
+      activities: undefined,
+      runtimeContext: {
+        version: 1,
+        revision: 8,
+        plan,
+        sideChat: {
+          version: 1,
+          id: '../unsafe-profile',
+          lifecycle: 'open',
+          frameworkId: 'codex',
+          historyPreamble: '',
+          entries: [],
+          pendingRelays: [],
+          createdAt: 1,
+          updatedAt: 1
+        }
+      }
+    })
+
+    expect(restored?.runtimeContext).toEqual({ version: 1, revision: 8, plan })
   })
 
   it('round-trips special Plan step titles without changing object prototypes', () => {

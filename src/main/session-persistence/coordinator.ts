@@ -4,6 +4,8 @@ import type {
   LoadAllSessionsResult,
   PersistedChatMessage,
   PersistedChatSession,
+  PersistedSideChat,
+  PersistedSideChatRelay,
   SaveSessionOptions,
   SaveSessionManifestRequest,
   UpdateSessionArchiveRequest,
@@ -24,6 +26,13 @@ import {
   type SessionMetadata,
   type SessionMetadataSnapshot
 } from './state-owner'
+import {
+  SessionSideChatPersistenceOwner,
+  type AppendSideChatRelayCommand,
+  type ClearSideChatCommand,
+  type CommitSideChatRelaysCommand,
+  type SaveSideChatProjectionCommand
+} from './side-chat-owner'
 import {
   SessionPersistenceDeletionOwner,
   type ComputeJobDeletionParticipant,
@@ -119,6 +128,7 @@ class SessionPersistenceCoordinator {
   private readonly deletedSessions = new Set<string>()
   private readonly deletedProjects = new Set<string>()
   private readonly stateOwner: SessionPersistenceStateOwner
+  private readonly sideChatOwner: SessionSideChatPersistenceOwner
   private readonly deletionOwner: SessionPersistenceDeletionOwner
   private readonly reconciliationOwner: SessionPersistenceReconciliationOwner
   private destructiveStartupWindowOpen = true
@@ -135,21 +145,31 @@ class SessionPersistenceCoordinator {
     private readonly log: Logger = createLogger('session-persistence'),
     private readonly computeJobs?: ComputeJobDeletionParticipant
   ) {
+    const assertMutable = (
+      projectId: string,
+      sessionId: string,
+      operation: 'save' | 'mutate'
+    ): void => {
+      if (this.deletedProjects.has(projectId)) {
+        throw new Error(`Cannot ${operation} a session whose project has been deleted.`)
+      }
+      if (this.deletedSessions.has(sessionKey(projectId, sessionId))) {
+        throw new Error(`Cannot ${operation} a session that has been deleted.`)
+      }
+    }
     this.stateOwner = new SessionPersistenceStateOwner({
       repository,
       fileIndex,
       provenance,
       uploads,
       log,
-      assertMutable: (projectId, sessionId, operation) => {
-        if (this.deletedProjects.has(projectId)) {
-          throw new Error(`Cannot ${operation} a session whose project has been deleted.`)
-        }
-        if (this.deletedSessions.has(sessionKey(projectId, sessionId))) {
-          throw new Error(`Cannot ${operation} a session that has been deleted.`)
-        }
-      },
+      assertMutable,
       notifyFilesChanged: (event) => this.notifyFilesChanged(event)
+    })
+    this.sideChatOwner = new SessionSideChatPersistenceOwner({
+      repository,
+      assertMutable: (projectId, sessionId) => assertMutable(projectId, sessionId, 'mutate'),
+      recordSession: (session) => this.stateOwner.recordSession(session)
     })
     this.deletionOwner = new SessionPersistenceDeletionOwner({
       repository,
@@ -187,6 +207,19 @@ class SessionPersistenceCoordinator {
     return this.enqueue(() =>
       this.stateOwner.containsMessageOnActiveBranch(projectId, sessionId, messageId)
     )
+  }
+
+  loadSessionForPermissionReplay(
+    projectId: string,
+    sessionId: string
+  ): Promise<PersistedChatSession> {
+    return this.enqueue(async () => {
+      const loaded = await this.repository.loadSessionWithDiagnostics(projectId, sessionId)
+      if (loaded.status !== 'found') {
+        throw new Error(`Cannot build permission replay for a ${loaded.status} Session.`)
+      }
+      return structuredClone(loaded.session)
+    })
   }
 
   // Binds unread cleanup to authoritative Session mutations. Reconciliation is called only with a
@@ -357,6 +390,40 @@ class SessionPersistenceCoordinator {
 
   readSessionRuntimeContext(projectId: string, sessionId: string): Promise<SessionRuntimeContext> {
     return this.enqueue(() => this.stateOwner.readRuntimeContext(projectId, sessionId))
+  }
+
+  loadPersistedSideChats(): Promise<{
+    sideChats: Array<{
+      projectId: string
+      parentSessionId: string
+      sideChat: PersistedSideChat
+    }>
+    relays: Array<{
+      projectId: string
+      parentSessionId: string
+      relays: readonly PersistedSideChatRelay[]
+    }>
+    isComplete: boolean
+  }> {
+    return this.enqueue(() => this.sideChatOwner.loadCatalog())
+  }
+
+  saveSideChatProjection(command: SaveSideChatProjectionCommand): Promise<PersistedSideChat> {
+    return this.enqueue(() => this.sideChatOwner.saveProjection(command))
+  }
+
+  appendSideChatRelay(command: AppendSideChatRelayCommand): Promise<void> {
+    return this.enqueue(() => this.sideChatOwner.appendRelay(command))
+  }
+
+  commitSideChatRelays(
+    command: CommitSideChatRelaysCommand
+  ): Promise<readonly PersistedChatMessage[]> {
+    return this.enqueue(() => this.sideChatOwner.commitRelays(command))
+  }
+
+  clearSideChat(command: ClearSideChatCommand): Promise<boolean> {
+    return this.enqueue(() => this.sideChatOwner.clear(command))
   }
 
   patchSessionRuntimeContext(

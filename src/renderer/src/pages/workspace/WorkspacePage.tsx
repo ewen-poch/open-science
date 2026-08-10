@@ -26,6 +26,7 @@ import {
   clearSuppressNextAutoReview
 } from '@/lib/acp/workspace-events'
 import { resolveEffectiveSpecialistSkills } from '../../../../shared/specialist'
+import { isCodexSubscriptionProvider } from '../../../../shared/settings'
 
 import {
   appendArtifactMention,
@@ -51,6 +52,7 @@ import { WorkspacePanelLayout } from './workspace-panel-layout'
 import { useWorkspaceComposerController } from './workspace-composer-controller'
 import { useWorkspaceConversationController } from './workspace-conversation-controller'
 import { useWorkspaceSessionController } from './workspace-session-controller'
+import { useSideChatController } from './use-side-chat-controller'
 
 type WorkspacePageProps = {
   isSessionPersistenceHydrated: boolean
@@ -81,6 +83,9 @@ const WorkspacePage = ({
   const goHome = useNavigationStore((state) => state.goHome)
   const openSettings = useSettingsStore((state) => state.openSettings)
   const activeProviderId = useSettingsStore((state) => state.activeProviderId)
+  const activeProviderType = useSettingsStore(
+    (state) => state.providers.find((provider) => provider.id === activeProviderId)?.type
+  )
   const defaultPermissionProfile = useSettingsStore((state) => state.defaultPermissionProfile)
   const catalogSkills = useSettingsStore((state) => state.skills)
   const loadSkills = useSettingsStore((state) => state.loadSkills)
@@ -276,6 +281,15 @@ const WorkspacePage = ({
     removeAttachment: removeComposerAttachment,
     setError: setAttachmentError
   } = composer.actions
+  const sideChat = useSideChatController(
+    activeSession ? { sessionId: activeSession.id, projectId: activeSession.projectId } : undefined
+  )
+  const sideChatDisabledReason =
+    sideChat.unavailableReason ??
+    (activeProviderType !== undefined && isCodexSubscriptionProvider(activeProviderType)
+      ? 'Side chat is unavailable for Codex subscription because strict tool isolation cannot be enforced.'
+      : undefined)
+
   useEffect(() => {
     const getPlanProjection = window.api.acp?.getPlanProjection
     if (!activeSession || activeSession.activePlanProjection || !getPlanProjection) return
@@ -359,6 +373,8 @@ const WorkspacePage = ({
     composer,
     session: sessionController,
     runtime,
+    sideChat: canEditDraft && !sideChatDisabledReason ? { start: sideChat.start } : undefined,
+    sideChatOpen: sideChat.view !== undefined,
     setAutoReviewEnabled,
     setEnabledComputeHosts,
     resetNewConversationSettings: () => {
@@ -469,8 +485,15 @@ const WorkspacePage = ({
     : activeSession?.status === 'error'
       ? 'Resolve the current session error before compacting.'
       : 'Wait for the current agent activity to finish.'
+  const durablePermissionError =
+    activeSession?.status === 'waiting-permission' &&
+    activeSession.runtimeContext?.permission?.state === 'pending'
+      ? (activeSession.error ?? actionError)
+      : null
   const visibleActionError =
-    attachmentError ?? sessionController.view.exportError ?? (activeSession ? null : actionError)
+    attachmentError ??
+    sessionController.view.exportError ??
+    (activeSession ? durablePermissionError : actionError)
 
   const compactActiveContext = useCallback((): void => {
     if (!activeSession || !canCompactContext) return
@@ -881,6 +904,13 @@ const WorkspacePage = ({
             onPlanFirst={(forcedSkillIds) =>
               conversation.actions.submit.draft({ forcedSkillIds, mode: 'plan-first' })
             }
+            sideChat={sideChat.view}
+            onStartSideChat={conversation.actions.sideChat.start}
+            sideChatDisabledReason={sideChatDisabledReason}
+            onSendSideChat={sideChat.send}
+            onSideChatDraftChange={sideChat.setDraft}
+            onCancelSideChat={sideChat.cancel}
+            onCloseSideChat={sideChat.close}
             onRespondToRestoredPlan={conversation.actions.submit.restoredPlan}
             onBranchInNewSession={
               activeSession

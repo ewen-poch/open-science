@@ -5,6 +5,7 @@ import { AcpAppContinuationOwner } from './app-continuation-owner'
 import { AcpContextUsagePolicy } from './context-usage-policy'
 import { AcpElicitationOwner } from './elicitation-owner'
 import { AcpPermissionContext } from './permission-context'
+import { AcpPermissionWaitOwner } from './permission-wait-owner'
 import { ReviewerSessionOwner } from './reviewer-session-owner'
 import type { AcpRuntimeOptions } from './runtime'
 import type { AcpRuntimeBaseOwners } from './runtime-base-composition'
@@ -121,6 +122,9 @@ const composeAcpRuntimeSessionOwners = (options: AcpRuntimeOptions, base: AcpRun
     presentation: base.sessionPresentationPolicy,
     registry: sessionRegistry,
     defaultProjectName: options.artifacts?.projectName,
+    ...(options.sessionCapabilityPolicy
+      ? { capabilityPolicy: options.sessionCapabilityPolicy }
+      : {}),
     ...(base.planService ? { planSystemPromptAppend: SESSION_PLAN_SYSTEM_PROMPT_APPEND } : {})
   })
   const contextUsagePolicy = new AcpContextUsagePolicy({
@@ -130,6 +134,10 @@ const composeAcpRuntimeSessionOwners = (options: AcpRuntimeOptions, base: AcpRun
     systemPromptAppends: () => sessionEnvironment.systemPromptAppends(),
     tooling: () => sessionEnvironment.toolingAvailability()
   })
+  const permissionWaitOwner = new AcpPermissionWaitOwner(
+    options.permissionWait?.sessions,
+    options.permissionWait?.onSessionUpdated
+  )
   const permissionContext = new AcpPermissionContext({
     emitPermissionRequest: (request) => publication.publishPermissionRequest(request),
     routing: {
@@ -151,6 +159,7 @@ const composeAcpRuntimeSessionOwners = (options: AcpRuntimeOptions, base: AcpRun
         return scope?.kind === 'prompt'
           ? {
               sequence: scope.sequence,
+              promptMessageId: scope.promptMessageId,
               isCancellationAccepted: () => base.sessionInteractions.isCancellationAccepted(scope)
             }
           : undefined
@@ -165,6 +174,10 @@ const composeAcpRuntimeSessionOwners = (options: AcpRuntimeOptions, base: AcpRun
     },
     conversationGrants: options.permissionGrantStore,
     permissionGrantRegistry: options.permissionGrantRegistry,
+    permissionWaitHooks: {
+      persist: (candidate) => permissionWaitOwner.persist(candidate),
+      settleLive: (candidate) => permissionWaitOwner.clearLive(candidate)
+    },
     setTimer: base.setTimer,
     clearTimer: base.clearTimer,
     onPermissionSettled: callbacks.onPermissionSettled,
@@ -226,6 +239,7 @@ const composeAcpRuntimeSessionOwners = (options: AcpRuntimeOptions, base: AcpRun
     publication,
     appContinuations,
     elicitationOwner,
+    permissionWaitOwner,
     permissionContext,
     reviewerSessions,
     sessionUpdateProjector

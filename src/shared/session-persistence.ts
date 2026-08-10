@@ -7,6 +7,7 @@ import {
   sanitizeAcpContextUsage,
   sanitizeAcpMessageImage,
   sanitizeAcpTurnTokenUsage,
+  type AcpPermissionRequest,
   type AcpContextUsage,
   type AcpMessageImage,
   type AcpTurnTokenUsage
@@ -41,6 +42,12 @@ import {
   type PersistedMessageNode,
   type PersistedRuntimeSegment
 } from './conversation-graph'
+import {
+  EXACT_PERMISSION_QUALIFIER_PATTERN,
+  PERMISSION_CAPABILITY_KINDS,
+  type PermissionCapability
+} from './permission-grants'
+import { SIDE_CHAT_MESSAGE_LIMIT, type SideChatEntry } from './side-chat'
 
 // One JSON file per session (sessions/<projectId>/<sessionId>.json) carries this envelope version.
 export const SESSION_FILE_VERSION = 2
@@ -62,7 +69,7 @@ export type SessionRuntimeContextValue =
   | SessionRuntimeContextValue[]
   | { [key: string]: SessionRuntimeContextValue }
 
-export type SessionRuntimeContextOwner = 'plan'
+export type SessionRuntimeContextOwner = 'plan' | 'permission'
 
 export type SessionPlanApproval = 'pending' | 'approved' | 'rejected'
 export type SessionPlanStepStatus = 'in_progress' | 'completed' | 'blocked' | 'skipped'
@@ -85,6 +92,40 @@ export type SessionPlanRuntimeContext = Readonly<{
   >
 }>
 
+export type SessionPermissionRuntimeContext = Readonly<{
+  state: 'pending' | 'continuing'
+  request: AcpPermissionRequest
+  originatingPromptMessageId: string
+  fingerprint: string
+  categoryKey?: string
+  capability?: PermissionCapability
+  createdAt: number
+}>
+
+export type PersistedSideChatLifecycle = 'open' | 'interrupted' | 'error'
+
+export type PersistedSideChatRelay = Readonly<{
+  id: string
+  sideChatId: string
+  text: string
+  createdAt: number
+}>
+
+export type PersistedSideChat = Readonly<{
+  version: 1
+  id: string
+  lifecycle: PersistedSideChatLifecycle
+  frameworkId: AgentFrameworkId
+  backendId?: string
+  providerSessionId?: string
+  providerContinuityToken?: string
+  model?: string
+  historyPreamble: string
+  entries: readonly SideChatEntry[]
+  createdAt: number
+  updatedAt: number
+}>
+
 // Main-owned mutable authority embedded in the Session record. Owner modules use top-level keys
 // (for example `plan`); renderer consumers receive this only as a read projection. Versioning lets a
 // future incompatible envelope fail closed instead of reviving authority under unknown semantics.
@@ -92,11 +133,15 @@ export type SessionRuntimeContext = Readonly<{
   version: 1
   revision: number
   plan?: SessionPlanRuntimeContext
+  permission?: SessionPermissionRuntimeContext
+  sideChat?: PersistedSideChat
+  sideChatRelays?: readonly PersistedSideChatRelay[]
 }>
 
-export type SessionRuntimeContextPatch = Readonly<
-  Partial<Record<SessionRuntimeContextOwner, SessionPlanRuntimeContext | undefined>>
->
+export type SessionRuntimeContextPatch = Readonly<{
+  plan?: SessionPlanRuntimeContext | undefined
+  permission?: SessionPermissionRuntimeContext | undefined
+}>
 
 // Stores artifact references only; file bytes stay on disk under the managed artifact root.
 export type PersistedArtifact = {
@@ -147,6 +192,8 @@ export type PersistedChatMessage = {
   // Closed user intent needed to reconstruct an interrupted turn after an app restart. Ordinary
   // messages omit it; unknown values are discarded by the persistence sanitizer.
   turnIntent?: 'plan-first'
+  // A side-chat relay is durable context, but remains advisory rather than a direct user turn.
+  relayedFrom?: { kind: 'side-chat'; direction: 'to-main' }
   // Whole-turn totals reported with the completed Agent response; absent for older sessions/providers.
   turnUsage?: AcpTurnTokenUsage
   // Marks the final Agent message for a turn whose provider did not report usable totals.
@@ -422,6 +469,185 @@ const PLAN_LIFECYCLES = new Set<PlanLifecycle>([
 const MAX_PLAN_HISTORY_PROJECTIONS = 100
 const MAX_PLAN_HISTORY_PROJECTION_JSON_CHARS = 512_000
 const MAX_PLAN_HISTORY_JSON_CHARS = 2_000_000
+const SIDE_CHAT_LIFECYCLES = new Set<PersistedSideChatLifecycle>(['open', 'interrupted', 'error'])
+const MAX_SIDE_CHAT_ENTRIES = 1_000
+const MAX_SIDE_CHAT_RELAYS = 100
+const MAX_SIDE_CHAT_JSON_CHARS = 2_000_000
+const MAX_SIDE_CHAT_ID_CHARS = 256
+const MAX_SIDE_CHAT_OPAQUE_CHARS = 1_024
+const MAX_SIDE_CHAT_TOOL_TITLE_CHARS = 1_024
+const MAX_SIDE_CHAT_TOOL_STATUS_CHARS = 128
+
+const hasOnlyKeys = (value: Record<string, unknown>, keys: readonly string[]): boolean =>
+  Object.keys(value).every((key) => keys.includes(key))
+
+const asBoundedString = (value: unknown, maxChars: number): string | undefined => {
+  const text = asString(value)
+  return text !== undefined && text.length <= maxChars ? text : undefined
+}
+
+const sanitizeSideChatEntry = (value: unknown): SideChatEntry | undefined => {
+  if (!isRecord(value)) return undefined
+  const id = asBoundedString(value.id, MAX_SIDE_CHAT_ID_CHARS)
+  const kind = asString(value.kind)
+  if (!id) return undefined
+
+  if (kind === 'message') {
+    if (!hasOnlyKeys(value, ['id', 'kind', 'role', 'text'])) return undefined
+    const role = asString(value.role)
+    const text = asBoundedString(value.text, SIDE_CHAT_MESSAGE_LIMIT)
+    if ((role !== 'user' && role !== 'assistant') || text === undefined) return undefined
+    return { id, kind, role, text }
+  }
+
+  if (kind === 'tool') {
+    if (!hasOnlyKeys(value, ['id', 'kind', 'title', 'status'])) return undefined
+    const title = asBoundedString(value.title, MAX_SIDE_CHAT_TOOL_TITLE_CHARS)
+    const status =
+      value.status === undefined
+        ? undefined
+        : asBoundedString(value.status, MAX_SIDE_CHAT_TOOL_STATUS_CHARS)
+    if (!title || (value.status !== undefined && status === undefined)) return undefined
+    return { id, kind, title, ...(status !== undefined ? { status } : {}) }
+  }
+
+  return undefined
+}
+
+const sanitizePersistedSideChatRelay = (
+  value: unknown,
+  legacySideChatId?: string
+): PersistedSideChatRelay | undefined => {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['id', 'sideChatId', 'text', 'createdAt'])) {
+    return undefined
+  }
+  const id = asBoundedString(value.id, MAX_SIDE_CHAT_ID_CHARS)
+  const sideChatId =
+    value.sideChatId === undefined
+      ? legacySideChatId
+      : asBoundedString(value.sideChatId, MAX_SIDE_CHAT_ID_CHARS)
+  const text = asBoundedString(value.text, SIDE_CHAT_MESSAGE_LIMIT)
+  const createdAt = asNumber(value.createdAt)
+  if (
+    !id ||
+    !sideChatId ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(sideChatId) ||
+    (legacySideChatId !== undefined && sideChatId !== legacySideChatId) ||
+    !text?.trim() ||
+    createdAt === undefined ||
+    createdAt < 0
+  ) {
+    return undefined
+  }
+  return { id, sideChatId, text, createdAt }
+}
+
+const sanitizePersistedSideChatWithLegacyRelays = (
+  value: unknown
+):
+  | Readonly<{
+      sideChat: PersistedSideChat
+      legacyRelays: readonly PersistedSideChatRelay[]
+    }>
+  | undefined => {
+  if (
+    !isRecord(value) ||
+    value.version !== 1 ||
+    !hasOnlyKeys(value, [
+      'version',
+      'id',
+      'lifecycle',
+      'frameworkId',
+      'backendId',
+      'providerSessionId',
+      'providerContinuityToken',
+      'model',
+      'historyPreamble',
+      'entries',
+      'pendingRelays',
+      'createdAt',
+      'updatedAt'
+    ]) ||
+    !Array.isArray(value.entries) ||
+    value.entries.length > MAX_SIDE_CHAT_ENTRIES ||
+    (value.pendingRelays !== undefined &&
+      (!Array.isArray(value.pendingRelays) || value.pendingRelays.length > MAX_SIDE_CHAT_RELAYS))
+  ) {
+    return undefined
+  }
+
+  const id = asBoundedString(value.id, MAX_SIDE_CHAT_ID_CHARS)
+  const lifecycle = asString(value.lifecycle) as PersistedSideChatLifecycle | undefined
+  const frameworkId = asString(value.frameworkId) as AgentFrameworkId | undefined
+  const backendId =
+    value.backendId === undefined
+      ? undefined
+      : asBoundedString(value.backendId, MAX_SIDE_CHAT_OPAQUE_CHARS)
+  const providerSessionId =
+    value.providerSessionId === undefined
+      ? undefined
+      : asBoundedString(value.providerSessionId, MAX_SIDE_CHAT_OPAQUE_CHARS)
+  const providerContinuityToken =
+    value.providerContinuityToken === undefined
+      ? undefined
+      : asBoundedString(value.providerContinuityToken, MAX_SIDE_CHAT_OPAQUE_CHARS)
+  const model =
+    value.model === undefined ? undefined : asBoundedString(value.model, MAX_SIDE_CHAT_OPAQUE_CHARS)
+  const historyPreamble = asBoundedString(value.historyPreamble, SIDE_CHAT_MESSAGE_LIMIT)
+  const createdAt = asNumber(value.createdAt)
+  const updatedAt = asNumber(value.updatedAt)
+  if (
+    !id ||
+    !/^[A-Za-z0-9][A-Za-z0-9_-]*$/u.test(id) ||
+    !lifecycle ||
+    !SIDE_CHAT_LIFECYCLES.has(lifecycle) ||
+    !frameworkId ||
+    !AGENT_FRAMEWORK_IDS.has(frameworkId) ||
+    (value.backendId !== undefined && backendId === undefined) ||
+    (value.providerSessionId !== undefined && providerSessionId === undefined) ||
+    (value.providerContinuityToken !== undefined && providerContinuityToken === undefined) ||
+    (value.model !== undefined && model === undefined) ||
+    historyPreamble === undefined ||
+    createdAt === undefined ||
+    createdAt < 0 ||
+    updatedAt === undefined ||
+    updatedAt < createdAt
+  ) {
+    return undefined
+  }
+
+  const entries = value.entries.map(sanitizeSideChatEntry)
+  const legacyRelays = (Array.isArray(value.pendingRelays) ? value.pendingRelays : []).map(
+    (relay) => sanitizePersistedSideChatRelay(relay, id)
+  )
+  if (entries.some((entry) => entry === undefined) || legacyRelays.some((relay) => !relay)) {
+    return undefined
+  }
+
+  const result: PersistedSideChat = {
+    version: 1,
+    id,
+    lifecycle,
+    frameworkId,
+    ...(backendId !== undefined ? { backendId } : {}),
+    ...(providerSessionId !== undefined ? { providerSessionId } : {}),
+    ...(providerContinuityToken !== undefined ? { providerContinuityToken } : {}),
+    ...(model !== undefined ? { model } : {}),
+    historyPreamble,
+    entries: entries as SideChatEntry[],
+    createdAt,
+    updatedAt
+  }
+  return JSON.stringify({ ...result, legacyRelays }).length <= MAX_SIDE_CHAT_JSON_CHARS
+    ? {
+        sideChat: result,
+        legacyRelays: legacyRelays as PersistedSideChatRelay[]
+      }
+    : undefined
+}
+
+export const sanitizePersistedSideChat = (value: unknown): PersistedSideChat | undefined =>
+  sanitizePersistedSideChatWithLegacyRelays(value)?.sideChat
 
 const sanitizeSessionPlanRuntimeContext = (
   value: unknown
@@ -502,6 +728,213 @@ const sanitizeSessionPlanRuntimeContext = (
   }
 }
 
+const PERMISSION_FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/
+const PERMISSION_SCOPES = new Set(['once', 'session', 'project', 'global'])
+const PERMISSION_OPTION_KINDS = new Set([
+  'allow_once',
+  'allow_always',
+  'reject_once',
+  'reject_always'
+])
+const PERMISSION_CAPABILITY_KIND_SET = new Set<string>(PERMISSION_CAPABILITY_KINDS)
+const MAX_PERMISSION_CONTEXT_STRING_CHARS = 16_000
+const MAX_PERMISSION_CONTEXT_RAW_CHARS = 8_000
+
+const boundedPermissionString = (value: unknown): string | undefined => {
+  const text = asString(value)
+  return text && text.length <= MAX_PERMISSION_CONTEXT_STRING_CHARS ? text : undefined
+}
+
+const sanitizePermissionRawInput = (value: unknown): unknown | undefined => {
+  if (value === undefined) return undefined
+  try {
+    const serialized = JSON.stringify(value)
+    if (serialized === undefined || serialized.length > MAX_PERMISSION_CONTEXT_RAW_CHARS) {
+      return undefined
+    }
+    return JSON.parse(serialized) as unknown
+  } catch {
+    return undefined
+  }
+}
+
+const sanitizePermissionCapability = (value: unknown): PermissionCapability | undefined => {
+  if (!isRecord(value)) return undefined
+  const kind = asString(value.kind)
+  const key = boundedPermissionString(value.key)?.trim()
+  if (!kind || !PERMISSION_CAPABILITY_KIND_SET.has(kind) || !key) return undefined
+
+  if (value.qualifier === undefined) {
+    return { kind: kind as PermissionCapability['kind'], key }
+  }
+  if (!isRecord(value.qualifier)) return undefined
+  const mode = asString(value.qualifier.mode)
+  if (mode === 'any') {
+    return { kind: kind as PermissionCapability['kind'], key, qualifier: { mode } }
+  }
+  const qualifierValue = boundedPermissionString(value.qualifier.value)?.trim()
+  if (
+    (mode !== 'category' && mode !== 'exact') ||
+    !qualifierValue ||
+    (mode === 'exact' && !EXACT_PERMISSION_QUALIFIER_PATTERN.test(qualifierValue))
+  ) {
+    return undefined
+  }
+  return {
+    kind: kind as PermissionCapability['kind'],
+    key,
+    qualifier: { mode, value: qualifierValue }
+  }
+}
+
+const sanitizePermissionRequest = (value: unknown): AcpPermissionRequest | undefined => {
+  if (!isRecord(value)) return undefined
+  const requestId = boundedPermissionString(value.requestId)
+  const sessionId = boundedPermissionString(value.sessionId)
+  const toolCallId = boundedPermissionString(value.toolCallId)
+  const title = boundedPermissionString(value.title)
+  if (!requestId || !sessionId || !toolCallId || !title || !Array.isArray(value.options)) {
+    return undefined
+  }
+
+  const optionIds = new Set<string>()
+  const options = value.options.flatMap((candidate) => {
+    if (!isRecord(candidate)) return []
+    const optionId = boundedPermissionString(candidate.optionId)
+    const name = boundedPermissionString(candidate.name)
+    const kind = boundedPermissionString(candidate.kind)
+    const scope = asString(candidate.scope)
+    const normalizedKind = kind?.toLowerCase()
+    if (
+      !optionId ||
+      !name ||
+      !kind ||
+      !normalizedKind ||
+      !PERMISSION_OPTION_KINDS.has(normalizedKind) ||
+      optionIds.has(optionId) ||
+      (scope !== undefined && !PERMISSION_SCOPES.has(scope)) ||
+      (scope === 'once' && normalizedKind !== 'allow_once') ||
+      ((scope === 'session' || scope === 'project' || scope === 'global') &&
+        normalizedKind !== 'allow_always')
+    ) {
+      return []
+    }
+    optionIds.add(optionId)
+    return [
+      {
+        optionId,
+        name,
+        kind,
+        ...(scope
+          ? { scope: scope as NonNullable<AcpPermissionRequest['options'][number]['scope']> }
+          : {})
+      }
+    ]
+  })
+  if (options.length === 0 || options.length !== value.options.length || options.length > 32) {
+    return undefined
+  }
+
+  const request: AcpPermissionRequest = { requestId, sessionId, toolCallId, title, options }
+  const status = boundedPermissionString(value.status)
+  const providerToolName = boundedPermissionString(value.providerToolName)
+  const mcpIdentity = boundedPermissionString(value.mcpIdentity)
+  const toolKind = boundedPermissionString(value.toolKind)
+  const commandPrefix = Array.isArray(value.commandPrefix)
+    ? value.commandPrefix.map(boundedPermissionString).filter((item): item is string => !!item)
+    : undefined
+  const toolLocations = Array.isArray(value.toolLocations)
+    ? value.toolLocations.flatMap((candidate) => {
+        if (!isRecord(candidate)) return []
+        const path = boundedPermissionString(candidate.path)
+        const line = asNumber(candidate.line)
+        if (!path || (line !== undefined && (!Number.isSafeInteger(line) || line < 0))) return []
+        return [{ path, ...(line === undefined ? {} : { line }) }]
+      })
+    : undefined
+  const rawInput = sanitizePermissionRawInput(value.rawInput)
+  if (value.rawInput !== undefined && rawInput === undefined) return undefined
+  if (
+    value.toolLocations !== undefined &&
+    (!Array.isArray(value.toolLocations) ||
+      toolLocations?.length !== value.toolLocations.length ||
+      toolLocations.length > 100)
+  ) {
+    return undefined
+  }
+  if (
+    value.commandPrefix !== undefined &&
+    (!Array.isArray(value.commandPrefix) ||
+      commandPrefix?.length !== value.commandPrefix.length ||
+      commandPrefix.length > 32)
+  ) {
+    return undefined
+  }
+
+  if (status) request.status = status
+  if (providerToolName) request.providerToolName = providerToolName
+  if (typeof value.isMcp === 'boolean') request.isMcp = value.isMcp
+  if (mcpIdentity) request.mcpIdentity = mcpIdentity
+  if (toolKind) request.toolKind = toolKind as AcpPermissionRequest['toolKind']
+  if (toolLocations) {
+    request.toolLocations = toolLocations as AcpPermissionRequest['toolLocations']
+  }
+  if (commandPrefix) request.commandPrefix = commandPrefix
+  if (rawInput !== undefined) request.rawInput = rawInput
+  return request
+}
+
+export const sanitizeSessionPermissionRuntimeContext = (
+  value: unknown
+): SessionPermissionRuntimeContext | undefined => {
+  if (!isRecord(value)) return undefined
+  if (
+    Object.keys(value).some(
+      (field) =>
+        ![
+          'request',
+          'state',
+          'originatingPromptMessageId',
+          'fingerprint',
+          'categoryKey',
+          'capability',
+          'createdAt'
+        ].includes(field)
+    )
+  ) {
+    return undefined
+  }
+  const request = sanitizePermissionRequest(value.request)
+  const state = value.state === undefined ? 'pending' : asString(value.state)
+  const originatingPromptMessageId = boundedPermissionString(value.originatingPromptMessageId)
+  const fingerprint = asString(value.fingerprint)
+  const categoryKey = boundedPermissionString(value.categoryKey)
+  const capability = sanitizePermissionCapability(value.capability)
+  const createdAt = asNumber(value.createdAt)
+  if (
+    !request ||
+    (state !== 'pending' && state !== 'continuing') ||
+    !originatingPromptMessageId ||
+    !fingerprint ||
+    !PERMISSION_FINGERPRINT_PATTERN.test(fingerprint) ||
+    createdAt === undefined ||
+    !Number.isSafeInteger(createdAt) ||
+    createdAt < 0 ||
+    (value.capability !== undefined && !capability)
+  ) {
+    return undefined
+  }
+  return {
+    state,
+    request,
+    originatingPromptMessageId,
+    fingerprint,
+    ...(categoryKey ? { categoryKey } : {}),
+    ...(capability ? { capability } : {}),
+    createdAt
+  }
+}
+
 export const sanitizeSessionRuntimeContext = (
   value: unknown
 ): SessionRuntimeContext | undefined => {
@@ -509,20 +942,61 @@ export const sanitizeSessionRuntimeContext = (
   const revision = asNumber(value.revision)
   if (revision === undefined || !Number.isSafeInteger(revision) || revision < 0) return undefined
 
-  const result: { version: 1; revision: number; plan?: SessionPlanRuntimeContext } = {
+  const result: {
+    version: 1
+    revision: number
+    plan?: SessionPlanRuntimeContext
+    permission?: SessionPermissionRuntimeContext
+    sideChat?: PersistedSideChat
+    sideChatRelays?: readonly PersistedSideChatRelay[]
+  } = {
     version: 1,
     revision
   }
+  let legacyRelays: readonly PersistedSideChatRelay[] = []
+  let directRelays: readonly PersistedSideChatRelay[] = []
   const budget = { remaining: 2_000 }
   for (const [owner, ownerValue] of Object.entries(value)) {
     if (owner === 'version' || owner === 'revision') continue
-    if (owner !== 'plan') return undefined
-    const sanitizedJson = sanitizeRuntimeContextValue(ownerValue, budget)
-    if (sanitizedJson === undefined) return undefined
-    const plan = sanitizeSessionPlanRuntimeContext(sanitizedJson)
-    if (!plan) return undefined
-    result.plan = plan
+    if (owner === 'plan' || owner === 'permission') {
+      const sanitizedJson = sanitizeRuntimeContextValue(ownerValue, budget)
+      if (sanitizedJson === undefined) return undefined
+      if (owner === 'plan') {
+        const plan = sanitizeSessionPlanRuntimeContext(sanitizedJson)
+        if (!plan) return undefined
+        result.plan = plan
+      } else {
+        const permission = sanitizeSessionPermissionRuntimeContext(sanitizedJson)
+        if (!permission) return undefined
+        result.permission = permission
+      }
+      continue
+    }
+    if (owner === 'sideChat') {
+      const sanitized = sanitizePersistedSideChatWithLegacyRelays(ownerValue)
+      if (sanitized) {
+        result.sideChat = sanitized.sideChat
+        legacyRelays = sanitized.legacyRelays
+      }
+      continue
+    }
+    if (owner === 'sideChatRelays') {
+      if (!Array.isArray(ownerValue) || ownerValue.length > MAX_SIDE_CHAT_RELAYS) continue
+      const relays = ownerValue.map((relay) => sanitizePersistedSideChatRelay(relay))
+      if (relays.some((relay) => relay === undefined)) continue
+      directRelays = relays as PersistedSideChatRelay[]
+      continue
+    }
+    return undefined
   }
+  const sideChatRelays = [...directRelays, ...legacyRelays]
+  if (sideChatRelays.length > MAX_SIDE_CHAT_RELAYS) return undefined
+  const relayIds = new Set<string>()
+  for (const relay of sideChatRelays) {
+    if (relayIds.has(relay.id)) return undefined
+    relayIds.add(relay.id)
+  }
+  if (sideChatRelays.length > 0) result.sideChatRelays = sideChatRelays
   return result
 }
 
@@ -624,9 +1098,35 @@ const asArtifactKind = (value: unknown): PersistedArtifactKind | undefined => {
   return kind && ARTIFACT_KINDS.has(kind) ? kind : undefined
 }
 
-// Identifies UI states that cannot survive an app process shutdown.
-const isSessionInterrupted = (status: PersistedSessionStatus): boolean =>
-  status === 'running' || status === 'waiting-permission'
+const isPermissionAuthorityBoundToActivePrompt = (
+  session: PersistedChatSession,
+  permission: SessionPermissionRuntimeContext
+): boolean => {
+  const activeMessages = session.conversationGraph
+    ? resolveActiveConversationMessages(session.conversationGraph)
+    : session.messages
+  return Boolean(
+    permission.request.sessionId === session.id &&
+    activeMessages.some(
+      (message) => message.id === permission.originatingPromptMessageId && message.role === 'user'
+    )
+  )
+}
+
+const hasRestorablePermissionWait = (session: PersistedChatSession): boolean => {
+  const permission = session.runtimeContext?.permission
+  return Boolean(
+    session.status === 'waiting-permission' &&
+    permission?.state === 'pending' &&
+    isPermissionAuthorityBoundToActivePrompt(session, permission)
+  )
+}
+
+// Identifies UI states that cannot survive an app process shutdown. Permission waits are durable
+// only when their main-owned authority and active-branch prompt binding survived with the Session.
+const isSessionInterrupted = (session: PersistedChatSession): boolean =>
+  session.status === 'running' ||
+  (session.status === 'waiting-permission' && !hasRestorablePermissionWait(session))
 
 // Converts partial streamed assistant messages into visible errors after restart.
 const normalizeMessageAfterRestore = (message: PersistedChatMessage): PersistedChatMessage =>
@@ -653,8 +1153,63 @@ const markInterruptedPrompt = (
 const latestUserMessageId = (messages: PersistedChatMessage[]): string | undefined =>
   [...messages].reverse().find((message) => message.role === 'user')?.id
 
-// Restores interrupted sessions as retryable errors because runtime state is gone.
+// Rehydrates durable waits and converts runtime-only work into recoverable states after restart.
 const normalizeSessionAfterRestore = (session: PersistedChatSession): PersistedChatSession => {
+  const persistedRuntimeContext = session.runtimeContext
+  const continuingPermission = persistedRuntimeContext?.permission
+  if (persistedRuntimeContext && continuingPermission?.state === 'continuing') {
+    if (isPermissionAuthorityBoundToActivePrompt(session, continuingPermission)) {
+      // The provider continuation died with the process. Re-present its durable request instead
+      // of automatically replaying privileged work that may already have partially completed.
+      return {
+        ...session,
+        status: 'waiting-permission',
+        activeRun: undefined,
+        runtimeContext: {
+          ...persistedRuntimeContext,
+          permission: {
+            ...continuingPermission,
+            state: 'pending'
+          }
+        },
+        resumeRecovery: undefined,
+        error: undefined,
+        errorReportable: undefined,
+        messages: session.messages.map(normalizeMessageAfterRestore)
+      }
+    }
+
+    const runtimeContext = { ...persistedRuntimeContext }
+    delete runtimeContext.permission
+    const promptMessageId = latestUserMessageId(session.messages)
+    return {
+      ...session,
+      status: 'error',
+      activeRun: undefined,
+      runtimeContext,
+      resumeRecovery: {
+        kind: 'resume-required',
+        cause: 'app-restart',
+        promptMessageId
+      },
+      error: session.error ?? INTERRUPTED_SESSION_ERROR,
+      messages: markInterruptedPrompt(
+        session.messages.map(normalizeMessageAfterRestore),
+        promptMessageId
+      )
+    }
+  }
+  if (hasRestorablePermissionWait(session)) {
+    return {
+      ...session,
+      status: 'waiting-permission',
+      activeRun: undefined,
+      resumeRecovery: undefined,
+      error: undefined,
+      errorReportable: undefined,
+      messages: session.messages.map(normalizeMessageAfterRestore)
+    }
+  }
   if (
     session.status === 'waiting-plan-approval' &&
     session.runtimeContext?.plan?.approval === 'pending'
@@ -665,7 +1220,7 @@ const normalizeSessionAfterRestore = (session: PersistedChatSession): PersistedC
       messages: session.messages.map(normalizeMessageAfterRestore)
     }
   }
-  if (!isSessionInterrupted(session.status)) {
+  if (!isSessionInterrupted(session)) {
     const legacyInterrupted =
       session.resumeRecovery === undefined && session.error === INTERRUPTED_SESSION_ERROR
     const promptMessageId =
@@ -1227,6 +1782,14 @@ const sanitizeMessage = (
   if (uploads.length > 0) sanitized.uploads = uploads
   if (parts.length > 0) sanitized.parts = parts
   if (role === 'user' && message.turnIntent === 'plan-first') sanitized.turnIntent = 'plan-first'
+  if (
+    role === 'user' &&
+    isRecord(message.relayedFrom) &&
+    message.relayedFrom.kind === 'side-chat' &&
+    message.relayedFrom.direction === 'to-main'
+  ) {
+    sanitized.relayedFrom = { kind: 'side-chat', direction: 'to-main' }
+  }
   if (images) sanitized.images = images
   if (turnUsage) sanitized.turnUsage = turnUsage
   if (turnUsageUnavailable) sanitized.turnUsageUnavailable = true

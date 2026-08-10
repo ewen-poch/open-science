@@ -50,6 +50,80 @@ describe('module test impact commands', () => {
     expect(plan.fallbackCapabilities).toEqual(['main_runtime'])
   })
 
+  it('expands User Skill repository changes through Settings and cross-surface consumers', () => {
+    const direct = createModuleTestPlan('user_skills_repository')
+    expect(direct.testFiles).toEqual(
+      expect.arrayContaining([
+        'src/main/skills/user-skill-repository.architecture.test.ts',
+        'src/main/skills/user-skill-repository.atomic.test.ts',
+        'src/main/skills/user-skill-repository.test.ts',
+        'src/main/skills/host-skills-service.test.ts',
+        'src/main/skills/conversation-import.test.ts',
+        'src/main/skills/specialist-package-adapter.test.ts',
+        'src/main/notebook/local-rpc-server.test.ts',
+        'src/main/notebook/local-rpc-server.skill-import.test.ts',
+        'src/main/notebook/local-rpc-server.skills.test.ts',
+        'src/main/settings/skill-catalog.test.ts',
+        'src/main/settings/service.test.ts',
+        'src/main/specialist/package/release-certification.test.ts',
+        'src/main/specialist/package/service.test.ts',
+        'src/preload/index.test.ts',
+        'src/renderer/src/pages/settings/SkillsPanel.render.test.tsx',
+        'src/renderer/src/stores/settings-skills-slice.test.ts'
+      ])
+    )
+
+    for (const { path, status } of [
+      { path: 'src/main/skills/user-skill-repository.ts', status: 'modified' },
+      { path: 'src/main/skills/user-skill-store.ts', status: 'modified' },
+      { path: 'src/main/skills/agent-home-skill-owner.ts', status: 'added' },
+      { path: 'src/main/skills/skill-bundle-import-owner.ts', status: 'modified' },
+      { path: 'src/main/skills/user-skill-import-contracts.ts', status: 'added' },
+      { path: 'src/main/skills/skill-mutation-owner.ts', status: 'modified' },
+      { path: 'src/main/skills/skill-package-transaction-owner.ts', status: 'modified' }
+    ] as const) {
+      const affected = createAffectedTestPlan([{ path, status }], {
+        status: 'current',
+        testFiles: []
+      })
+      expect([...affected.modules].sort()).toEqual([
+        'settings_service_facade',
+        'user_skills_repository',
+        'workspace_page',
+        'workspace_runtime'
+      ])
+      expect(affected.reasonChains).toEqual(
+        expect.arrayContaining([
+          'user_skills_repository -> settings_service_facade',
+          'user_skills_repository -> settings_service_facade -> workspace_runtime',
+          'user_skills_repository -> settings_service_facade -> workspace_runtime -> workspace_page'
+        ])
+      )
+      expect(affected.testFiles).toEqual(
+        expect.arrayContaining([
+          'packages/open-science/cli.test.ts',
+          'src/main/acp/task-agent-port.test.ts',
+          'src/main/notebook/local-rpc-notebook-adapter.test.ts',
+          'src/main/notebook/local-rpc-server.mcpcall.test.ts',
+          'src/main/notebook/local-rpc-server.skill-import.test.ts',
+          'src/main/notebook/local-rpc-server.skills.test.ts',
+          'src/main/notebook/mcp-server.test.ts',
+          'src/main/settings/ipc.test.ts',
+          'src/main/web-service/http-server.test.ts',
+          'src/preload/electron-renderer-contract-adapter.test.ts',
+          'src/preload/index.test.ts',
+          'src/renderer/src/pages/settings/SkillsPanel.render.test.tsx',
+          'src/renderer/src/stores/settings-skills-slice.test.ts',
+          'src/renderer/src/stores/settings-store.test.ts',
+          'src/renderer/web/api-installer.test.ts',
+          'src/shared/renderer-surface-inventory.test.ts',
+          'src/shared/renderer-surface-matrix.test.ts',
+          'src/shared/web-rpc-contract.test.ts'
+        ])
+      )
+    }
+  })
+
   it('expands changed owners through consumer modules and graph candidates', () => {
     const plan = createAffectedTestPlan(
       [{ path: 'src/main/artifacts/repository.ts', status: 'modified' }],
@@ -99,6 +173,21 @@ describe('module test impact commands', () => {
   it.each([
     [
       'src/main/settings/repository.ts',
+      [
+        'artifact_provenance',
+        'compute_service',
+        'reviewer_orchestrator',
+        'session_persistence',
+        'settings_backend_resolution',
+        'settings_provider_accounts',
+        'settings_repository',
+        'settings_service_facade',
+        'workspace_page',
+        'workspace_runtime'
+      ]
+    ],
+    [
+      'src/main/settings/compute-grant-port.ts',
       [
         'artifact_provenance',
         'compute_service',
@@ -186,7 +275,8 @@ describe('module test impact commands', () => {
     expect(plan.mode).toBe('selective')
     expect([...plan.modules].sort()).toEqual(expectedModules)
     const rootModule =
-      path === 'src/main/settings/repository.ts'
+      path === 'src/main/settings/repository.ts' ||
+      path === 'src/main/settings/compute-grant-port.ts'
         ? 'settings_repository'
         : path === 'src/main/settings/provider-accounts.ts'
           ? 'settings_provider_accounts'
@@ -208,6 +298,17 @@ describe('module test impact commands', () => {
               `${rootModule} -> settings_service_facade -> workspace_runtime`
             ]
       )
+    )
+    expect(plan.testFiles).toEqual(
+      expect.arrayContaining([
+        'src/shared/renderer-surface-inventory.test.ts',
+        'src/shared/renderer-surface-matrix.test.ts',
+        'src/shared/web-rpc-contract.test.ts',
+        'src/main/notebook/local-rpc-notebook-adapter.test.ts',
+        'src/main/notebook/local-rpc-server.mcpcall.test.ts',
+        'src/main/notebook/mcp-server.test.ts',
+        'src/main/web-service/http-server.test.ts'
+      ])
     )
   })
 

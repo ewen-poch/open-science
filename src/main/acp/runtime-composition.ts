@@ -4,6 +4,7 @@ import { app } from 'electron'
 
 import type { AcpPermissionRequest, AcpRuntimeEvent, AcpStateSnapshot } from '../../shared/acp'
 import { DEFAULT_ARTIFACT_PROJECT_NAME } from '../../shared/artifacts'
+import { MAIN_PERMISSION_WAIT_LIFECYCLE_CLIENT_ID } from '../../shared/lifecycle-events'
 import {
   filterSpecialistConnectorSkills,
   resolveEffectiveSpecialistSkills
@@ -86,7 +87,10 @@ type AcpRuntimeCompositionOptions = AcpRuntimeArtifacts & {
     | 'patchSessionRuntimeContext'
     | 'appendUserMessageToInteraction'
     | 'containsMessageOnActiveBranch'
+    | 'loadSessionForPermissionReplay'
+    | 'sessionProjectId'
   >
+  sideChatRelays?: AcpRuntimeOptions['sideChatRelays']
 }
 
 // Composes the compatibility façade while the coordinator remains the cross-generation Session owner.
@@ -113,7 +117,8 @@ const createAcpRuntime = ({
   onDisconnected,
   beforeSessionDelete,
   profileService,
-  sessionPersistenceCoordinator
+  sessionPersistenceCoordinator,
+  sideChatRelays
 }: AcpRuntimeCompositionOptions): AcpRuntimeCoordinator => {
   const configRoot = resolveConfigRoot()
   const dataRoot = resolveDataRoot()
@@ -208,6 +213,24 @@ const createAcpRuntime = ({
         },
         ...(sessionPersistenceCoordinator
           ? {
+              permissionWait: {
+                sessions: sessionPersistenceCoordinator,
+                onSessionUpdated: (session) => {
+                  try {
+                    broadcastToRenderers('session:updated', {
+                      session,
+                      originClientId: MAIN_PERMISSION_WAIT_LIFECYCLE_CLIENT_ID
+                    })
+                  } catch (error) {
+                    // The durable commit remains authoritative when a renderer projection is gone.
+                    log.warn('permission wait Session publication failed', errorLogFields(error))
+                  }
+                }
+              }
+            }
+          : {}),
+        ...(sessionPersistenceCoordinator
+          ? {
               plan: {
                 mcpEntryPath,
                 getRpcConnection: ({ sessionId, projectId }) =>
@@ -259,6 +282,7 @@ const createAcpRuntime = ({
             }
           : {}),
         callbacks: runtimeCallbacks,
+        sideChatRelays,
         permissionGrantStore,
         permissionGrantRegistry,
         resolveSpecialistIdentity: profileService
